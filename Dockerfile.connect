@@ -1,0 +1,19 @@
+# Kafka Connect (standalone mode) with the MongoDB source connector baked in.
+# Same Kafka version as the broker; the connector is the -all (uber) jar, since
+# the plain jar is missing its dependencies and fails with ClassNotFoundException.
+FROM apache/kafka:4.2.1
+
+ARG MONGO_CONNECTOR_VERSION=3.1.0
+
+USER root
+RUN mkdir -p /opt/connect-plugins/mongodb /var/lib/connect \
+ && chown -R appuser /opt/connect-plugins /var/lib/connect
+ADD --chown=appuser https://repo1.maven.org/maven2/org/mongodb/kafka/mongo-kafka-connect/${MONGO_CONNECTOR_VERSION}/mongo-kafka-connect-${MONGO_CONNECTOR_VERSION}-all.jar \
+    /opt/connect-plugins/mongodb/
+USER appuser
+
+# Config files are mounted from ./connect-config, so editing them only needs
+# `docker compose restart kafka-connect`, not a rebuild.
+CMD ["/opt/kafka/bin/connect-standalone.sh", \
+     "/opt/connect-config/connect-standalone.properties", \
+     "/opt/connect-config/mongo-source-connector.properties"]
