@@ -1,0 +1,5 @@
+{"settlement_id": "stl_test_pay001", "reference_id": "PAY-001", "rail": "INSTAPAY", "status": "SETTLED", "failure_reason": null, "settled_at": "2026-09-25T09:30:05+08:00"}
+{"settlement_id": "stl_test_pay002", "reference_id": "PAY-002", "rail": "PESONET", "status": "SETTLED", "failure_reason": null, "settled_at": "2026-09-25T10:08:00+08:00"}
+{"settlement_id": "stl_test_pay005", "reference_id": "PAY-005", "rail": "PESONET", "status": "SETTLED", "failure_reason": null, "settled_at": "2026-09-25T14:30:00+08:00"}
+{"settlement_id": "stl_test_pay003", "reference_id": "PAY-003", "rail": "PESONET", "status": "FAILED", "failure_reason": "ACCOUNT_CLOSED", "settled_at": "2026-09-25T16:05:00+08:00"}
+{"settlement_id": "stl_test_pay004", "reference_id": "PAY-004", "rail": "PESONET", "status": "SETTLED", "failure_reason": null, "settled_at": "2026-09-28T10:06:00+08:00"}
