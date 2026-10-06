@@ -3,7 +3,7 @@
 --
 -- Column ownership (so jobs never overwrite each other's data):
 --   Job A writes institution_registry.
---   Job B writes the routing decision columns and invalid_intent_events.
+--   Job B writes the routing decision columns, risk_flags, invalid_intent_events, and payment-dlq.
 --   Job C writes the settlement_* / turnaround / webhook columns, settlement_alerts_by_rail
 --   and webhook_events_by_reference.
 
@@ -38,6 +38,8 @@ CREATE TABLE IF NOT EXISTS payment_pipeline.transaction_lifecycle_by_reference (
     kafka_partition              int,
     kafka_offset                 bigint,
     processed_at                 timestamp,
+    -- Job B: fraud/risk flags (null for clean payments; comma-separated for flagged ones)
+    risk_flags                   text,       -- e.g. HIGH_VALUE,SUSPICIOUS_AMOUNT
     -- Job C: settlement tracking (null until Job C sees the routed transfer)
     settlement_status            text,       -- AWAITING_SETTLEMENT | SETTLED | SETTLED_LATE | FAILED | STUCK
     settled_at                   timestamp,
@@ -116,3 +118,5 @@ ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXIST
 ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXISTS last_webhook_at timestamp;
 ALTER TABLE payment_pipeline.settlement_monitoring_by_institution ADD IF NOT EXISTS settled_at timestamp;
 ALTER TABLE payment_pipeline.settlement_monitoring_by_institution ADD IF NOT EXISTS turnaround_ms bigint;
+-- Addition 2 (fraud/risk): risk_flags column for Job B
+ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXISTS risk_flags text;

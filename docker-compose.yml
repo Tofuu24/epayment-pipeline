@@ -75,7 +75,7 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        for t in institution-registry-events payment-intent-events rail-routing-events settlement-events webhook-events; do
+        for t in institution-registry-events payment-intent-events rail-routing-events settlement-events webhook-events payment-dlq; do
           /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:19092 --create --if-not-exists --topic "$$t" --partitions 1 --replication-factor 1
         done
     restart: "no"
