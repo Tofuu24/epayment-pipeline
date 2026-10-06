@@ -1,56 +1,44 @@
-# AI Handoff & Project Context
+# AI Handoff - E-Payment Pipeline (Phase 7 - Fraud & Holidays Integration)
 
-## What This Project Is
-This is a real-time Change Data Capture (CDC) pipeline designed for monitoring Philippine e-payment institution data and validating payment routing decisions using BSP InstaPay/PESONet rules and PayMongo's API model.
+## 1. What was done in this session
+We successfully integrated and validated the **fraud detection and holiday handling features** (Job B) after encountering severe serialization crashes. 
 
-The architecture flows as follows:
-`MongoDB (Source of Truth) -> Kafka Connect -> Apache Kafka -> Apache Spark -> Apache Cassandra`
+**The core issue:**
+The `feature-fraud-and-holidays` branch introduced a Python UDF for calculating PESONet settlement windows (`pesonet_window_udf`). However, the `cloudpickle` serializer packaged with PySpark 3.5.7 in this specific WSL environment is fundamentally broken—it caused a `RecursionError: Stack overflow` even when pickling a trivial `lambda x: x` function.
 
-## What We Have Built So Far
-1. **MongoDB**: Installed as a replica set (`rs0`) and seeded with 5 mock institutions (banks and e-wallets like BPI, GCash, Maya) with metadata such as supported rails and active status.
-2. **Apache Kafka & Connect**: Set up Kafka in KRaft mode. Kafka Connect is running with the MongoDB Source Connector (`copy_existing` enabled).
-3. **CDC Ingestion**: Kafka Connect is actively capturing live document changes from MongoDB and publishing the full JSON documents into the `institution-registry-events` Kafka topic.
-4. **Docker Compose**: The team has successfully unified MongoDB, Kafka, Kafka Connect, and Cassandra into a single `docker-compose.yml` for reproducible local environments.
-5. **Cassandra Schema Drafted**: The keyspace (`payment_pipeline`) and schemas for the tables have been drafted in `cassandra-init/schema.cql` but wait to be fully leveraged by Spark.
+**The fixes applied:**
+*   **Bypassed `cloudpickle` Entirely:** We replaced all custom Python UDFs in `validate_and_ledger_job.py` with pure native Spark SQL expressions. 
+*   **Created `sql_udfs.py`:** We translated the complex holiday/weekend skipping logic into a Spark SQL higher-order array function (`element_at(filter(transform(sequence...)))`) to dynamically compute the next valid settlement window without relying on Python execution on the workers.
+*   **Pipeline Stabilization:** Restarted the WSL/Docker environment after network degradation caused DNS timeouts with the Nager.Date API.
 
----
+## 2. Current State & Validation
+The pipeline is fully operational and the new features have been **validated successfully**.
 
-## AI Handoff Prompt
+*   **Job A, Job B, and Job C** are currently running in the background.
+*   Job B is currently running with `HOLIDAY_SOURCE=none` (to bypass WSL DNS issues) and `BLOCKED_INSTITUTIONS=BANK_BLOCKED_TEST`.
+*   **Regression & Feature Tests Passed:** We injected `test_intents.jsonl` and `test_fraud_intents.jsonl` into Kafka. 
+    *   Queried Cassandra `transaction_lifecycle_by_reference` and confirmed that events are successfully processed and routed.
+    *   Fraud `risk_flags` (`RAPID_REPEAT`, `HIGH_VALUE`, `SUSPICIOUS_AMOUNT`) are successfully evaluated and populated in the ledger.
+    *   The blocked institution test (`PAY-FRAUD-006`) correctly failed validation and was routed to `invalid_intent_events` with the reason `BLOCKED_INSTITUTION`.
 
-*Copy and paste the text below into Claude, ChatGPT, or any other AI assistant to get them up to speed instantly.*
+## 3. What Claude needs to do next
 
-***
+1.  **Verify Job C Compatibility (Immediate Next Step):**
+    *   Job B is successfully attaching `risk_flags` to the events published to `rail-routing-events`.
+    *   Job C must be reviewed to ensure it correctly consumes, parses, and persists these `risk_flags` through to the final settlement tracking tables, or drops them intentionally if they are only meant for routing.
 
-**System Context:**
-Act as a Senior Data Engineer. We are building a real-time CDC pipeline for e-payment routing in the Philippines. I need you to take the wheel and help me implement the missing pieces for our Spark and Cassandra integration.
+2.  **Holistic Refactor for E-Payment Standards (Main Objective):**
+    *   The user requested a comprehensive review and refactor to align the pipeline with **real-world e-payment pipeline standards**. Now that the features work functionally, evaluate the architecture, schema design, latency considerations, and fault tolerance patterns.
 
-**Architecture:**
-- **Source**: MongoDB (v8.0) replica set (`rs0`).
-- **Message Broker**: Kafka (v4.2.1) running locally on port 9092. Topic `institution-registry-events` has live CDC JSON data from Mongo. A second topic `payment-intent-events` will receive test payment transactions.
-- **Processing**: Apache Spark (v3.5.7). Must be run via PySpark Structured Streaming.
-- **Sink**: Apache Cassandra (v5.0) running on port 9042 with a keyspace `payment_pipeline`.
+3.  **Robust Holiday API Handling:**
+    *   Job B currently fetches Philippine holidays from the Nager API at driver startup. If DNS fails, it hangs or crashes. We are currently bypassing it with `HOLIDAY_SOURCE=none`. Implement a safer fallback mechanism or caching strategy for production-grade reliability.
 
-**Current Status:**
-The upstream ingestion (MongoDB -> Kafka Connect -> Kafka) is 100% complete and working via Docker Compose. The topics exist, and Cassandra is initialized with empty tables.
-
-**What Needs To Be Done (Your Task):**
-
-1. **Spark Job A (Registry Sync)**
-   - Write a PySpark Structured Streaming job in Python (`spark/registry_sync_job.py`).
-   - It must read from the Kafka topic `institution-registry-events` (`startingOffsets=earliest`).
-   - Extract the `fullDocument` JSON (which contains `institution_code`, `active`, `rail_eligibility`, etc.).
-   - Upsert the latest state of each institution into Cassandra's `institution_registry` table. Since Kafka acts as an append-only log, the Spark job must ensure it keeps the latest offset per institution. Use `foreachBatch` with `outputMode("append")`.
-
-2. **Spark Job B (Payment Validation & Routing)**
-   - Write a second PySpark job (`spark/validate_and_ledger_job.py`).
-   - It reads payment intents from the Kafka topic `payment-intent-events`.
-   - For every micro-batch, it must query Cassandra's `institution_registry` to check if the source and destination banks are active and which rails (InstaPay/PESONet) they support.
-   - Apply routing rules (e.g., if amount <= PHP 50,000 and both support InstaPay -> Route to InstaPay. If > 50,000 -> Route to PESONet).
-   - Calculate the settlement window (PESONet has specific batch windows: 10:00, 13:00, 16:00 Manila time).
-   - Write the outcome (ROUTED or REJECTED with reasons) into Cassandra's `transaction_lifecycle_by_reference` table.
-
-**Constraints:**
-- Use PySpark 3.5.7 compatibility (using `spark-sql-kafka-0-10_2.12:3.5.7` and `spark-cassandra-connector_2.12:3.5.1`).
-- Provide production-ready, well-commented Python scripts. 
-
-Where should we start? Do you want to tackle Spark Job A first?
+**Note to Claude (updated):** The earlier claim that cloudpickle is "fundamentally
+broken" was wrong. The real cause is that **PySpark 3.5's *bundled* cloudpickle
+recurses forever on Python 3.12+**; standalone `cloudpickle>=3.1` fixes it. The fix is
+centralized in `spark/_cloudpickle_compat.py` (imported by Job C, which needs
+`applyInPandasWithState`) and `cloudpickle>=3.1` is now in `requirements.txt`. Python
+UDFs therefore *do* work. Job B still uses native Spark SQL (`sql_udfs.py`) for the
+holiday/window logic — not because UDFs are impossible, but because JVM-native SQL is
+the better fit there (no Python round-trip). Prefer `F.expr`/DataFrame API when it's
+natural; reach for a Python UDF only when the logic genuinely can't be expressed in SQL.

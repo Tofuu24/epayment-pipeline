@@ -4,6 +4,8 @@
 pyspark==3.5.7          # only needed for pytest; spark-submit uses $SPARK_HOME's copy
 pandas==2.2.3           # Job C (applyInPandasWithState)
 pyarrow==17.0.0         # Job C
+cloudpickle>=3.1        # Job C: PySpark 3.5's bundled cloudpickle recurses forever on
+                        # Python 3.12+; 3.1+ fixes it. See spark/_cloudpickle_compat.py.
 numpy>=1.26
 confluent-kafka>=2.4    # simulator
 cassandra-driver>=3.29  # benchmark/cassandra_lookup_bench.py

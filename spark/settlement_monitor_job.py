@@ -22,15 +22,10 @@
 #   SETTLED_LATE         confirmed after the deadline (including after being flagged STUCK)
 #   FAILED               the rail reported a failure
 #   STUCK                no confirmation by settlement_due + grace (watermark passed it)
-import sys
-sys.path.insert(0, '/mnt/c/Users/Lenovo/Documents/epayment-pipeline/cloudpickle_pkg')
-import cloudpickle
-import pyspark.cloudpickle
-pyspark.cloudpickle.CloudPickler = cloudpickle.CloudPickler
-pyspark.cloudpickle.dumps = cloudpickle.dumps
-pyspark.cloudpickle.dump = cloudpickle.dump
-pyspark.cloudpickle.loads = cloudpickle.loads
-pyspark.cloudpickle.load = cloudpickle.load
+# Make PySpark use a modern cloudpickle before anything serializes a Python
+# function (this job's state machine runs inside applyInPandasWithState). The fix
+# lives in one shared module instead of a per-job, hardcoded-path monkeypatch.
+import _cloudpickle_compat  # noqa: F401  (import for its import-time side effect)
 
 import json
 import math
@@ -52,6 +47,9 @@ KEYSPACE = "payment_pipeline"
 ROUTING_TOPIC = "rail-routing-events"
 SETTLEMENT_TOPIC = "settlement-events"
 WEBHOOK_TOPIC = "webhook-events"
+# Malformed inputs (unparseable JSON / missing required fields) go here instead of
+# being silently filtered out, mirroring Job B's payment-dlq.
+DLQ_TOPIC = os.getenv("SETTLEMENT_DLQ_TOPIC", "settlement-dlq")
 
 # How far behind the newest event time Spark waits for stragglers before acting.
 WATERMARK_DELAY = os.getenv("WATERMARK_DELAY", "2 minutes")
@@ -69,18 +67,19 @@ ALERT_STATUSES = ("STUCK", "FAILED", "SETTLED_LATE")
 
 from settlement_udfs import track_settlement, OUTPUT_FIELDS, STATE_FIELDS
 
-# Input schemas are now defined inside the parse_* functions to avoid global StructType objects which crash cloudpickle in PySpark 3.10+.
+# Input schemas are defined inside the parse_* functions (local to each) rather than
+# as module globals, to keep what gets captured by closures small and obvious.
 
 # Unified event fed to the state machine (one schema for both input streams).
 EVENT_COLUMNS = ["reference_id", "kind", "event_time", "event_ms", "rail",
                  "source_institution_code", "destination_institution_code", "amount",
-                 "created_ms", "due_ms", "settle_status", "failure_reason"]
+                 "created_ms", "due_ms", "settle_status", "failure_reason", "risk_flags"]
 
-STATE_SCHEMA = "routed STRING, rail STRING, src STRING, dst STRING, amount LONG, created_ms LONG, due_ms LONG, status STRING, settled_ms LONG, failure STRING, changed_ms LONG, pend_status STRING, pend_ms LONG, pend_failure STRING"
-STATE_FIELDS = ["routed", "rail", "src", "dst", "amount", "created_ms", "due_ms", "status", "settled_ms", "failure", "changed_ms", "pend_status", "pend_ms", "pend_failure"]
+STATE_SCHEMA = "routed STRING, rail STRING, src STRING, dst STRING, amount LONG, created_ms LONG, due_ms LONG, status STRING, settled_ms LONG, failure STRING, changed_ms LONG, pend_status STRING, pend_ms LONG, pend_failure STRING, risk_flags STRING"
+STATE_FIELDS = ["routed", "rail", "src", "dst", "amount", "created_ms", "due_ms", "status", "settled_ms", "failure", "changed_ms", "pend_status", "pend_ms", "pend_failure", "risk_flags"]
 
-OUTPUT_SCHEMA = "reference_id STRING, rail STRING, source_institution_code STRING, destination_institution_code STRING, amount LONG, created_ms LONG, due_ms LONG, settlement_status STRING, settled_ms LONG, turnaround_ms LONG, failure_reason STRING, status_changed_ms LONG"
-OUTPUT_FIELDS = ["reference_id", "rail", "source_institution_code", "destination_institution_code", "amount", "created_ms", "due_ms", "settlement_status", "settled_ms", "turnaround_ms", "failure_reason", "status_changed_ms"]
+OUTPUT_SCHEMA = "reference_id STRING, rail STRING, source_institution_code STRING, destination_institution_code STRING, amount LONG, created_ms LONG, due_ms LONG, settlement_status STRING, settled_ms LONG, turnaround_ms LONG, failure_reason STRING, status_changed_ms LONG, risk_flags STRING"
+OUTPUT_FIELDS = ["reference_id", "rail", "source_institution_code", "destination_institution_code", "amount", "created_ms", "due_ms", "settlement_status", "settled_ms", "turnaround_ms", "failure_reason", "status_changed_ms", "risk_flags"]
 
 
 # UDFs moved to settlement_udfs.py
@@ -94,7 +93,7 @@ def parse_routing(raw):
         .add("reference_id", StringType()).add("status", StringType()).add("rail", StringType())
         .add("source_institution_code", StringType()).add("destination_institution_code", StringType())
         .add("amount", LongType()).add("created_at", TimestampType())
-        .add("settlement_due", TimestampType()))
+        .add("settlement_due", TimestampType()).add("risk_flags", StringType()))
     r = raw.select(F.from_json(F.col("value").cast("string"), ROUTING_SCHEMA).alias("r")).select("r.*")
     r = r.filter((F.col("status") == "ROUTED") & F.col("reference_id").isNotNull()
                  & F.col("created_at").isNotNull() & F.col("settlement_due").isNotNull())
@@ -104,7 +103,8 @@ def parse_routing(raw):
         "rail", "source_institution_code", "destination_institution_code", "amount",
         _ms("created_at").alias("created_ms"), _ms("settlement_due").alias("due_ms"),
         F.lit(None).cast("string").alias("settle_status"),
-        F.lit(None).cast("string").alias("failure_reason"))
+        F.lit(None).cast("string").alias("failure_reason"),
+        "risk_flags")
 
 
 def parse_settlements(raw):
@@ -122,7 +122,8 @@ def parse_settlements(raw):
         F.lit(None).cast("string").alias("destination_institution_code"),
         F.lit(None).cast("long").alias("amount"),
         F.lit(None).cast("long").alias("created_ms"), F.lit(None).cast("long").alias("due_ms"),
-        F.col("status").alias("settle_status"), "failure_reason")
+        F.col("status").alias("settle_status"), "failure_reason",
+        F.lit(None).cast("string").alias("risk_flags"))
 
 
 def settlement_status_stream(routing_events, settlement_events):
@@ -166,6 +167,70 @@ def dedupe_webhooks(webhooks):
             .dropDuplicatesWithinWatermark(["event_id"]))
 
 
+# ---- Dead-letter queue -----------------------------------------------------------
+# Each input stream filters out messages it can't use (bad JSON, missing required
+# fields). These guards capture exactly those messages and publish the raw payload to
+# the DLQ so nothing is dropped silently. They are additive, separate streaming queries
+# that never touch the working state-machine path. "Valid but not applicable" messages
+# (e.g. a REJECTED routing event, which the state machine intentionally ignores) are NOT
+# dead-lettered — only genuinely malformed ones are.
+
+def _dlq_value(source_topic, reason, raw_col):
+    return F.to_json(F.struct(
+        F.lit(source_topic).alias("source_topic"),
+        F.lit(reason).alias("failure_reason"),
+        F.current_timestamp().cast("string").alias("failed_at"),
+        raw_col.alias("original_payload")))
+
+
+def routing_dlq(raw):
+    schema = (StructType().add("reference_id", StringType()).add("status", StringType())
+              .add("created_at", TimestampType()).add("settlement_due", TimestampType()))
+    rv = F.col("value").cast("string")
+    j = F.from_json(rv, schema)
+    bad = raw.select(rv.alias("raw_value"), j.alias("j")).filter(
+        F.col("j").isNull()
+        | F.col("j.reference_id").isNull()
+        # A ROUTED event that can't be tracked (no timestamps) is malformed; other
+        # statuses legitimately omit them, so don't dead-letter those.
+        | ((F.col("j.status") == "ROUTED")
+           & (F.col("j.created_at").isNull() | F.col("j.settlement_due").isNull())))
+    return bad.select(_dlq_value(ROUTING_TOPIC, "MALFORMED_ROUTING_EVENT",
+                                 F.col("raw_value")).alias("value"))
+
+
+def settlement_dlq(raw):
+    schema = (StructType().add("reference_id", StringType()).add("status", StringType())
+              .add("settled_at", TimestampType()))
+    rv = F.col("value").cast("string")
+    j = F.from_json(rv, schema)
+    bad = raw.select(rv.alias("raw_value"), j.alias("j")).filter(
+        F.col("j").isNull()
+        | F.col("j.reference_id").isNull()
+        | F.col("j.settled_at").isNull()
+        | ~F.col("j.status").isin("SETTLED", "FAILED"))
+    return bad.select(_dlq_value(SETTLEMENT_TOPIC, "MALFORMED_SETTLEMENT_EVENT",
+                                 F.col("raw_value")).alias("value"))
+
+
+def webhook_dlq(raw):
+    schema = StructType().add("data", StructType()
+        .add("id", StringType())
+        .add("attributes", StructType()
+             .add("created_at", LongType())
+             .add("data", StructType().add("attributes", StructType()
+                  .add("metadata", StructType().add("reference_id", StringType()))))))
+    rv = F.col("value").cast("string")
+    j = F.from_json(rv, schema)
+    bad = raw.select(rv.alias("raw_value"), j.alias("j")).filter(
+        F.col("j").isNull()
+        | F.col("j.data.id").isNull()
+        | F.col("j.data.attributes.created_at").isNull()
+        | F.col("j.data.attributes.data.attributes.metadata.reference_id").isNull())
+    return bad.select(_dlq_value(WEBHOOK_TOPIC, "MALFORMED_WEBHOOK_EVENT",
+                                 F.col("raw_value")).alias("value"))
+
+
 # ---- Sinks -----------------------------------------------------------------------
 def write_cassandra(df, table):
     (df.write.format("org.apache.spark.sql.cassandra")
@@ -198,7 +263,7 @@ def write_status_batch(batch_df, batch_id):
             "rail", "status_changed_at", "reference_id",
             F.col("settlement_status").alias("alert_type"),
             "source_institution_code", "destination_institution_code", "amount",
-            "created_at", "settlement_due", "failure_reason"),
+            "created_at", "settlement_due", "failure_reason", "risk_flags"),
             "settlement_alerts_by_rail")
 
         counts = df.groupBy("settlement_status").count().orderBy("settlement_status").collect()
@@ -278,7 +343,23 @@ def main():
           .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "webhooks"))
           .start())
 
-    run_with_metrics([q1, q2], METRICS_FILE)
+    # Dead-letter malformed inputs on each source topic (additive; independent of the
+    # working path above). A bug here can't corrupt the ledger — the query just fails
+    # on its own and the state-machine queries keep running.
+    dlq_specs = [("routing_dlq", routing_dlq, ROUTING_TOPIC),
+                 ("settlement_dlq", settlement_dlq, SETTLEMENT_TOPIC),
+                 ("webhook_dlq", webhook_dlq, WEBHOOK_TOPIC)]
+    dlq_queries = []
+    for name, fn, topic in dlq_specs:
+        q = (fn(kafka_stream(spark, topic)).writeStream.queryName(name)
+             .format("kafka")
+             .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+             .option("topic", DLQ_TOPIC)
+             .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, name))
+             .start())
+        dlq_queries.append(q)
+
+    run_with_metrics([q1, q2, *dlq_queries], METRICS_FILE)
 
 
 if __name__ == "__main__":

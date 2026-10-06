@@ -38,6 +38,8 @@ from pyspark.sql import SparkSession, Window
 from pyspark.sql import functions as F
 from pyspark.sql.types import LongType, StringType, StructType, TimestampType
 
+import sql_udfs
+
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "127.0.0.1")
 CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", os.path.expanduser("~/checkpoints/validate_ledger"))
@@ -45,6 +47,9 @@ METRICS_FILE = os.getenv("METRICS_FILE", "")          # optional: JSON-lines of 
 SHUFFLE_PARTITIONS = os.getenv("SHUFFLE_PARTITIONS", "8")
 
 KEYSPACE = "payment_pipeline"
+# Bump when the ledger row shape written below changes, so downstream readers and
+# migrations can tell which writer produced a row.
+LEDGER_SCHEMA_VERSION = 1
 INTENT_TOPIC = "payment-intent-events"
 ROUTING_TOPIC = "rail-routing-events"
 DLQ_TOPIC = "payment-dlq"
@@ -111,73 +116,7 @@ _HOLIDAY_SET: set = _load_holiday_set()
 
 # ---- Holiday-aware PESONet window UDF ----------------------------------------
 
-def _next_pesonet_window_py(ts_value, holidays_broadcast):
-    """
-    Python implementation of the PESONet window logic.
-    ts_value: a Python datetime (Manila TZ expected from Spark's session TZ)
-    Returns: datetime at the next valid PESONet business window (not weekend, not holiday).
 
-    Algorithm:
-      1. Find the next clearing window (10, 13, or 16) strictly after ts_value on its date.
-         If past all windows today, move to 10:00 the following calendar day.
-      2. Loop: while candidate date is a weekend OR a holiday, advance by one calendar day
-         at PESONET_WINDOW_HOURS[0]:00.
-      3. Return the final candidate.
-    """
-    if ts_value is None:
-        return None
-
-    holidays = holidays_broadcast  # plain Python set passed via UDF closure
-
-    # Ensure we have a tz-aware Manila datetime
-    if ts_value.tzinfo is None:
-        ts = ts_value.replace(tzinfo=MANILA_TZ)
-    else:
-        ts = ts_value.astimezone(MANILA_TZ)
-
-    ts_date = ts.date()
-
-    # Step 1: find the first window strictly after ts on ts_date
-    candidate = None
-    for h in PESONET_WINDOW_HOURS:
-        window_dt = datetime.datetime(ts_date.year, ts_date.month, ts_date.day, h, 0, 0,
-                                      tzinfo=MANILA_TZ)
-        if ts < window_dt:
-            candidate = window_dt
-            break
-
-    # Past all windows today → first window tomorrow
-    if candidate is None:
-        next_day = ts_date + datetime.timedelta(days=1)
-        candidate = datetime.datetime(next_day.year, next_day.month, next_day.day,
-                                      PESONET_WINDOW_HOURS[0], 0, 0, tzinfo=MANILA_TZ)
-
-    # Step 2: skip weekends (Mon=0 ... Sun=6 in Python's weekday()) and holidays
-    while True:
-        wd = candidate.weekday()   # 5=Saturday, 6=Sunday
-        if wd in (5, 6) or candidate.date() in holidays:
-            next_day = candidate.date() + datetime.timedelta(days=1)
-            candidate = datetime.datetime(next_day.year, next_day.month, next_day.day,
-                                          PESONET_WINDOW_HOURS[0], 0, 0, tzinfo=MANILA_TZ)
-        else:
-            break
-
-    return candidate
-
-
-def _make_pesonet_window_udf(holiday_set: set):
-    """
-    Returns a Spark UDF that accepts a timestamp and returns the next valid
-    PESONet business window, skipping weekends and Philippine public holidays.
-    The holiday_set is captured as a closure (serialised with the UDF).
-    """
-    # Freeze the set into a frozenset so it serialises cleanly.
-    frozen = frozenset(holiday_set)
-
-    def _udf_fn(ts):
-        return _next_pesonet_window_py(ts, frozen)
-
-    return F.udf(_udf_fn, TimestampType())
 
 
 # ---- SQL helpers (still used for _next_window_sql; _skip_weekend_sql is replaced) ----
@@ -287,27 +226,24 @@ def evaluate_fraud_risk(intents):
         is_blocked = F.lit(False)
 
     # Assemble risk_flags as a comma-separated string (null when no flags)
-    flags_array = F.filter(
-        F.array(
-            F.when(high_value,    F.lit("HIGH_VALUE")),
-            F.when(suspicious,    F.lit("SUSPICIOUS_AMOUNT")),
-            F.when(rapid_repeat,  F.lit("RAPID_REPEAT")),
-        ),
-        lambda x: x.isNotNull()
+    raw_flags = F.array(
+        F.when(high_value,    F.lit("HIGH_VALUE")),
+        F.when(suspicious,    F.lit("SUSPICIOUS_AMOUNT")),
+        F.when(rapid_repeat,  F.lit("RAPID_REPEAT")),
     )
+    df = df.withColumn("_raw_flags", raw_flags)
+    flags_array = F.expr("filter(_raw_flags, x -> x is not null)")
     risk_flags_col = F.when(F.size(flags_array) > 0, F.array_join(flags_array, ","))
 
     return (df
             .withColumn("risk_flags", risk_flags_col)
             .withColumn("blocked", is_blocked)
-            .drop("_pair_rn"))
+            .drop("_pair_rn", "_raw_flags"))
 
 
-def route(intents, registry, pesonet_window_udf):
+def route(intents, registry, _unused=None):
     """Pure routing logic: intents (parsed, one row per reference_id) + registry
     snapshot -> one decision row per intent. No I/O, so it can be unit-tested.
-
-    pesonet_window_udf: a Spark UDF(timestamp) -> timestamp that skips weekends + holidays.
     """
     reg = registry.select("institution_code", "active", "rail_eligibility")
     src = reg.select(F.col("institution_code").alias("src_code"),
@@ -363,7 +299,7 @@ def route(intents, registry, pesonet_window_udf):
         .withColumn("routing_reason", F.when(ok, candidate_reason))
         .withColumn("next_window", F.expr(_next_window_sql("created_ts")))
         .withColumn("batch_window", F.when(F.col("rail") == "PESONET",
-                                           pesonet_window_udf(F.col("next_window"))))
+                                           F.expr(sql_udfs.get_pesonet_window_expr("next_window", _HOLIDAY_SET))))
         .withColumn("settlement_due",
                     F.when(F.col("rail") == "INSTAPAY",
                            F.expr(f"created_ts + INTERVAL {INSTAPAY_SLA_SECONDS} SECONDS"))
@@ -422,8 +358,7 @@ def invalid_rows(df, reason, now):
 
 # ---- Core batch handler ------------------------------------------------------
 
-# Module-level UDF, built once per process using the holiday set loaded at import time.
-_PESONET_WINDOW_UDF = _make_pesonet_window_udf(_HOLIDAY_SET)
+# Module-level UDF is gone. We create it inside process_batch or pass it directly.
 
 
 def process_batch(batch_df, batch_id):
@@ -460,7 +395,7 @@ def process_batch(batch_df, batch_id):
 
         # Blocked payments → REJECTED / BLOCKED_INSTITUTION, DLQ, invalid_intent_events.
         # They must NOT appear on rail-routing-events.
-        if not blocked.rdd.isEmpty():
+        if not blocked.isEmpty():
             blocked_decided = (blocked
                 .withColumn("status",           F.lit("REJECTED"))
                 .withColumn("rejection_reason", F.lit("BLOCKED_INSTITUTION"))
@@ -477,7 +412,10 @@ def process_batch(batch_df, batch_id):
         # Fresh registry snapshot every micro-batch so a MongoDB change (via Job A)
         # affects validation immediately, without restarting this job.
         registry = read_cassandra(spark, "institution_registry")
-        decided  = route(routable, registry, _PESONET_WINDOW_UDF) \
+        
+        # Route the non-blocked intents.
+        # No Python UDF is used; everything is handled via Spark SQL expressions to avoid pickling bugs.
+        decided  = route(routable, registry, None) \
                        .withColumn("processed_at", now).persist()
 
         # Step 7: Publish to rail-routing-events (includes risk_flags).
@@ -498,7 +436,9 @@ def process_batch(batch_df, batch_id):
             "amount", "currency", F.col("created_ts").alias("created_at"),
             "status", "rail", "routing_reason", "rejection_reason",
             "batch_window", "settlement_due", F.col("metadata").alias("metadata_json"),
-            "kafka_partition", "kafka_offset", "processed_at", "risk_flags"),
+            "kafka_partition", "kafka_offset", "processed_at", "risk_flags",
+            F.lit(LEDGER_SCHEMA_VERSION).alias("schema_version"),
+            now.alias("ingested_at")),
             "transaction_lifecycle_by_reference")
 
         # Summary log line

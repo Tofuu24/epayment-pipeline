@@ -5,8 +5,8 @@ INSTAPAY_GRACE_SECONDS = int(os.getenv("INSTAPAY_GRACE_SECONDS", "30"))
 PESONET_GRACE_SECONDS = int(os.getenv("PESONET_GRACE_SECONDS", "3600"))
 TERMINAL = {"SETTLED", "SETTLED_LATE", "FAILED"}
 LONG_FIELDS = {"event_ms", "amount", "created_ms", "due_ms"}
-STATE_FIELDS = ["routed", "rail", "src", "dst", "amount", "created_ms", "due_ms", "status", "settled_ms", "failure", "changed_ms", "pend_status", "pend_ms", "pend_failure"]
-OUTPUT_FIELDS = ["reference_id", "rail", "source_institution_code", "destination_institution_code", "amount", "created_ms", "due_ms", "settlement_status", "settled_ms", "turnaround_ms", "failure_reason", "status_changed_ms"]
+STATE_FIELDS = ["routed", "rail", "src", "dst", "amount", "created_ms", "due_ms", "status", "settled_ms", "failure", "changed_ms", "pend_status", "pend_ms", "pend_failure", "risk_flags"]
+OUTPUT_FIELDS = ["reference_id", "rail", "source_institution_code", "destination_institution_code", "amount", "created_ms", "due_ms", "settlement_status", "settled_ms", "turnaround_ms", "failure_reason", "status_changed_ms", "risk_flags"]
 
 def grace_ms(rail):
     return 1000 * (INSTAPAY_GRACE_SECONDS if rail == "INSTAPAY" else PESONET_GRACE_SECONDS)
@@ -38,6 +38,10 @@ def apply_events(state, events):
         if e["kind"] == "ROUTED":
             s["routed"], s["rail"], s["src"], s["dst"] = "Y", e["rail"], e["source_institution_code"], e["destination_institution_code"]
             s["amount"], s["created_ms"], s["due_ms"] = e["amount"], e["created_ms"], e["due_ms"]
+            # risk_flags ride along on the routing event (Job B's fraud/risk output); a
+            # SETTLEMENT event never carries them, so only ROUTED sets this. .get() keeps
+            # older/minimal event dicts (and unit-test fixtures) from raising KeyError.
+            s["risk_flags"] = e.get("risk_flags")
             if s["status"] is None:
                 s["status"], s["changed_ms"] = "AWAITING_SETTLEMENT", e["event_ms"]
 
@@ -71,7 +75,7 @@ def _clean(name, v):
 def output_row(reference_id, s):
     turnaround = s["settled_ms"] - s["created_ms"] if s["settled_ms"] and s["created_ms"] else None
     return (reference_id, s["rail"], s["src"], s["dst"], s["amount"], s["created_ms"], s["due_ms"],
-            s["status"], s["settled_ms"], turnaround, s["failure"], s["changed_ms"])
+            s["status"], s["settled_ms"], turnaround, s["failure"], s["changed_ms"], s["risk_flags"])
 
 def track_settlement(key, pdf_iter, state):
     import pandas as pd

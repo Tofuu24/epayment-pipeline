@@ -93,15 +93,18 @@ def test_job_c_status_writes(spark, monkeypatch):
     sinks = FakeSinks()
     monkeypatch.setattr(C, "write_cassandra", sinks.write)
     t = 1_790_000_000_000
-    rows = [("A", "INSTAPAY", "BANK_BPI", "EMI_GCASH", 100, t, t + 30_000, "SETTLED", t + 5000, 5000, None, t + 5000),
-            ("B", "INSTAPAY", "BANK_BPI", "EMI_GCASH", 100, t, t + 30_000, "STUCK", None, None, None, t + 60_000),
-            ("D", "PESONET", "BANK_BPI", "BANK_UNIONBANK", 100, t, t + 3_600_000, "FAILED", t + 9000, 9000, "AML_HOLD", t + 9000)]
+    rows = [("A", "INSTAPAY", "BANK_BPI", "EMI_GCASH", 100, t, t + 30_000, "SETTLED", t + 5000, 5000, None, t + 5000, "HIGH_VALUE"),
+            ("B", "INSTAPAY", "BANK_BPI", "EMI_GCASH", 100, t, t + 30_000, "STUCK", None, None, None, t + 60_000, None),
+            ("D", "PESONET", "BANK_BPI", "BANK_UNIONBANK", 100, t, t + 3_600_000, "FAILED", t + 9000, 9000, "AML_HOLD", t + 9000, "RAPID_REPEAT")]
     df = spark.createDataFrame(rows, C.OUTPUT_SCHEMA)
     C.write_status_batch(df, 0)
     assert_columns_exist(sinks.writes)
     assert len(sinks.writes["transaction_lifecycle_by_reference"]) == 3
     assert len(sinks.writes["settlement_monitoring_by_institution"]) == 3
     assert sorted(r["alert_type"] for r in sinks.writes["settlement_alerts_by_rail"]) == ["FAILED", "STUCK"]
+    # risk_flags from Job B is carried through Job C onto the alert rows.
+    alert_d = [r for r in sinks.writes["settlement_alerts_by_rail"] if r["reference_id"] == "D"][0]
+    assert alert_d["risk_flags"] == "RAPID_REPEAT"
     a = [r for r in sinks.writes["transaction_lifecycle_by_reference"] if r["reference_id"] == "A"][0]
     assert (a["settled_at"] - a["settlement_updated_at"]).total_seconds() == 0
 

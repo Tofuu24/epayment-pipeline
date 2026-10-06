@@ -38,6 +38,10 @@ CREATE TABLE IF NOT EXISTS payment_pipeline.transaction_lifecycle_by_reference (
     kafka_partition              int,
     kafka_offset                 bigint,
     processed_at                 timestamp,
+    -- Job B: ledger provenance. schema_version lets consumers/migrations tell which
+    -- writer shape produced the row; ingested_at is when Job B committed it.
+    schema_version               int,
+    ingested_at                  timestamp,
     -- Job B: fraud/risk flags (null for clean payments; comma-separated for flagged ones)
     risk_flags                   text,       -- e.g. HIGH_VALUE,SUSPICIOUS_AMOUNT
     -- Job C: settlement tracking (null until Job C sees the routed transfer)
@@ -92,6 +96,7 @@ CREATE TABLE IF NOT EXISTS payment_pipeline.settlement_alerts_by_rail (
     created_at                   timestamp,
     settlement_due               timestamp,
     failure_reason               text,
+    risk_flags                   text,       -- carried from Job B, e.g. HIGH_VALUE,RAPID_REPEAT
     PRIMARY KEY ((rail), status_changed_at, reference_id, alert_type)
 ) WITH CLUSTERING ORDER BY (status_changed_at DESC, reference_id ASC, alert_type ASC);
 
@@ -120,3 +125,8 @@ ALTER TABLE payment_pipeline.settlement_monitoring_by_institution ADD IF NOT EXI
 ALTER TABLE payment_pipeline.settlement_monitoring_by_institution ADD IF NOT EXISTS turnaround_ms bigint;
 -- Addition 2 (fraud/risk): risk_flags column for Job B
 ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXISTS risk_flags text;
+-- risk_flags carried through Job C onto the settlement alerts table.
+ALTER TABLE payment_pipeline.settlement_alerts_by_rail ADD IF NOT EXISTS risk_flags text;
+-- Ledger provenance columns (Job B).
+ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXISTS schema_version int;
+ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXISTS ingested_at timestamp;
