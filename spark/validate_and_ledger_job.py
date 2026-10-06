@@ -1,21 +1,26 @@
 # Spark Job B: validate payment intents against the live institution registry,
-# route each one to InstaPay or PESONet, assign PESONet clearing windows, and
-# write the ledger to Cassandra.
+# route each one to InstaPay or PESONet, assign PESONet clearing windows, write
+# the ledger to Cassandra, and publish each routed transfer to rail-routing-events.
 #
 # Run from WSL, with the Compose stack up and Job A running in another tab:
 #   spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.7,com.datastax.spark:spark-cassandra-connector_2.12:3.5.1 validate_and_ledger_job.py
 #
-# Input (topic payment-intent-events), one JSON object per message:
-#   {"reference_id": "PAY-001", "source_institution_code": "BANK_BPI",
-#    "destination_institution_code": "EMI_GCASH", "amount": 150000, "currency": "PHP",
-#    "created_at": "2026-09-25T09:30:00+08:00", "metadata": {"channel": "mobile"}}
+# Input (topic payment-intent-events), one PayMongo-style Payment Intent per message:
+#   {"id": "PAY-001", "amount": 150000, "currency": "PHP", "status": "processing",
+#    "payment_method_allowed": ["dob"], "created_at": "2026-09-25T09:30:00+08:00",
+#    "metadata": {"source_institution_code": "BANK_BPI",
+#                 "destination_institution_code": "EMI_GCASH", "channel": "mobile"}}
 # amount is in centavos (PayMongo convention): 150000 = PHP 1,500.00.
+# Our custom routing fields live inside PayMongo's metadata object, never at the top level.
 # The producer does NOT choose the rail; this job does.
+#
+# Output (topic rail-routing-events), one message per ROUTED intent, keyed by
+# reference_id; format in SPARK_GUIDE.md section 5.
 import os
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import LongType, StringType, StructType
+from pyspark.sql.types import LongType, MapType, StringType, StructType
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 CASSANDRA_HOST = os.getenv("CASSANDRA_HOST", "127.0.0.1")
@@ -23,6 +28,7 @@ CHECKPOINT_DIR = os.getenv("CHECKPOINT_DIR", os.path.expanduser("~/checkpoints/v
 
 KEYSPACE = "payment_pipeline"
 INTENT_TOPIC = "payment-intent-events"
+ROUTING_TOPIC = "rail-routing-events"
 
 # ---- Routing rules (from the proposal; change here, nowhere else) -------------
 INSTAPAY_CAP_CENTAVOS = 5_000_000      # PHP 50,000.00 per transaction, inclusive
@@ -34,14 +40,19 @@ INSTAPAY_SLA_SECONDS = int(os.getenv("INSTAPAY_SLA_SECONDS", "30"))
 # participant, e.g. Landbank here), send it via PESONet instead of rejecting it.
 ALLOW_PESONET_FALLBACK = os.getenv("ALLOW_PESONET_FALLBACK", "true").lower() == "true"
 
+# Only the fields routing needs. status and payment_method_allowed are part of
+# the message (PayMongo shape) but don't affect routing, so they aren't parsed.
 INTENT_SCHEMA = (StructType()
-    .add("reference_id", StringType())
-    .add("source_institution_code", StringType())
-    .add("destination_institution_code", StringType())
+    .add("id", StringType())
     .add("amount", LongType())
     .add("currency", StringType())
     .add("created_at", StringType())
-    .add("metadata", StringType()))    # nested object is kept as its raw JSON text
+    # PayMongo metadata is flat key -> string; non-string values arrive as their JSON text
+    .add("metadata", MapType(StringType(), StringType())))
+
+# Timestamps in rail-routing-events: ISO 8601 with offset, e.g. 2026-09-25T10:00:00.000+08:00
+ROUTING_JSON_OPTIONS = {"timestampFormat": "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
+                        "ignoreNullFields": "false"}   # batch_window: null for InstaPay, not missing
 
 
 def _at_hour(date_sql, hour):
@@ -136,6 +147,26 @@ def write_cassandra(df, table):
        .mode("append").save())
 
 
+def publish_routing_events(routed):
+    """One message per routed transfer on rail-routing-events, keyed by reference_id.
+    At-least-once: a replayed micro-batch publishes again, so consumers must
+    treat a repeated reference_id as a duplicate."""
+    event = F.struct(
+        "reference_id", "source_institution_code", "destination_institution_code",
+        "amount", "currency",
+        F.col("rail").alias("rail_selected"), "routing_reason",
+        F.lit(INSTAPAY_CAP_CENTAVOS).alias("threshold_applied"),
+        F.col("created_ts").alias("created_at"),
+        "batch_window", "settlement_due",
+        F.col("processed_at").alias("routing_timestamp"))
+    (routed.select(F.col("reference_id").alias("key"),
+                   F.to_json(event, ROUTING_JSON_OPTIONS).alias("value"))
+        .write.format("kafka")
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS)
+        .option("topic", ROUTING_TOPIC)
+        .save())
+
+
 def process_batch(batch_df, batch_id):
     if batch_df.isEmpty():
         return
@@ -144,11 +175,11 @@ def process_batch(batch_df, batch_id):
         now = F.current_timestamp()
         has_ref = F.col("reference_id").isNotNull() & (F.trim(F.col("reference_id")) != "")
 
-        # Messages we can't key (not JSON, or no reference_id) are kept, not dropped.
+        # Messages we can't key (not JSON, or no id) are kept, not dropped.
         unkeyed = batch_df.filter(~has_ref)
         write_cassandra(unkeyed.select(
             "kafka_topic", "kafka_partition", "kafka_offset", "raw_value",
-            F.lit("UNPARSEABLE_OR_MISSING_REFERENCE_ID").alias("reason"),
+            F.lit("UNPARSEABLE_OR_MISSING_ID").alias("reason"),
             now.alias("received_at")), "invalid_intent_events")
 
         # Fresh registry snapshot every micro-batch, so a MongoDB change (via Job A)
@@ -169,12 +200,17 @@ def process_batch(batch_df, batch_id):
             "kafka_partition", "kafka_offset", "processed_at"),
             "transaction_lifecycle_by_reference")
 
-        write_cassandra(decided.filter(F.col("status") == "ROUTED").select(
+        routed = decided.filter(F.col("status") == "ROUTED")
+        write_cassandra(routed.select(
             "rail", "source_institution_code", "settlement_due", "reference_id",
             "destination_institution_code", "amount", "batch_window",
             F.col("created_ts").alias("created_at"),
             F.lit("AWAITING_SETTLEMENT").alias("settlement_status")),
             "settlement_monitoring_by_institution")
+
+        # Published after the Cassandra writes, so the ledger row already exists
+        # by the time anything downstream sees the routing event.
+        publish_routing_events(routed)
 
         summary = decided.groupBy("status", F.coalesce("rail", "rejection_reason").alias("detail")) \
                          .count().orderBy("status", "detail").collect()
@@ -204,7 +240,14 @@ if __name__ == "__main__":
                 F.col("offset").alias("kafka_offset"),
                 F.col("value").cast("string").alias("raw_value"))
         .withColumn("i", F.from_json("raw_value", INTENT_SCHEMA))
-        .select("kafka_topic", "kafka_partition", "kafka_offset", "raw_value", "i.*"))
+        # Flatten to the column names route() works with; the routing fields
+        # come out of metadata, the rest are PayMongo's own top-level fields.
+        .select("kafka_topic", "kafka_partition", "kafka_offset", "raw_value",
+                F.col("i.id").alias("reference_id"),
+                F.col("i.metadata")["source_institution_code"].alias("source_institution_code"),
+                F.col("i.metadata")["destination_institution_code"].alias("destination_institution_code"),
+                "i.amount", "i.currency", "i.created_at",
+                F.to_json("i.metadata").alias("metadata")))
 
     (intents_stream.writeStream
         .foreachBatch(process_batch)

@@ -16,11 +16,21 @@ Kafka topic: institution-registry-events      Kafka topic: payment-intent-events
    ▼                                               ▼
 Spark Job A (registry sync)            Spark Job B (validate, route, ledger)
    │                                        ▲      │
-   ▼                                        │      ▼
-Cassandra: institution_registry ────────────┘   Cassandra: transaction_lifecycle_by_reference,
-          (Job B re-reads it every micro-batch)            settlement_monitoring_by_institution,
-                                                           invalid_intent_events
+   ▼                                        │      ├──► Cassandra: transaction_lifecycle_by_reference,
+Cassandra: institution_registry ────────────┘      │               settlement_monitoring_by_institution,
+          (Job B re-reads it every micro-batch)    │               invalid_intent_events
+                                                   ▼
+                                     Kafka topic: rail-routing-events
+                                                   │
+                                                   ▼
+                                     simulator/consumer.py (settlement simulator)
+                                                   │
+                                                   ▼
+                                     Kafka topics: settlement-events, webhook-events  ──► Job C (next)
 ```
+
+`payment-intent-events` is fed by `simulator/producer.py` (live traffic) or `test_intents.jsonl`
+(fixed rule check). See [SPARK_GUIDE.md](SPARK_GUIDE.md) sections 5-7.
 
 > **Don't edit `docker-compose.yml` unless you're the person who maintains it.**
 > This file is known to work. If something breaks, report it (with `docker compose ps -a`
@@ -131,6 +141,8 @@ docker exec -it cassandra cqlsh -k payment_pipeline
 | After editing `connect-config/*.properties` | `docker compose restart kafka-connect` |
 | After adding tables to `cassandra-init/schema.cql` | `docker compose up -d cassandra-init` |
 | After adding topics to `kafka-init` in `docker-compose.yml` | `docker compose up -d kafka-init` |
+| Install the simulator's Python dependency | `pip install -r simulator/requirements.txt` |
+| Live intents / settlements (see SPARK_GUIDE.md section 7) | `python simulator/producer.py` / `python simulator/consumer.py` |
 | Send the test payment intents (PowerShell, project folder) | `Get-Content test_intents.jsonl \| docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 --topic payment-intent-events` |
 
 > After `docker compose down -v`, Kafka's topics are recreated empty. Anyone running Spark must
@@ -148,6 +160,9 @@ mongo-init/seed.js                       replica set init + 5 institutions (idem
 cassandra-init/schema.cql                keyspace + tables (idempotent)
 spark/registry_sync_job.py               Spark Job A: registry sync, Kafka -> Cassandra
 spark/validate_and_ledger_job.py         Spark Job B: validate, route, assign PESONet windows, ledger
+simulator/producer.py                    live PayMongo-style payment intents -> payment-intent-events
+simulator/consumer.py                    settlement simulator: rail-routing-events -> settlement-events, webhook-events
+simulator/requirements.txt               kafka-python, for the two scripts above
 test_intents.jsonl                       14 test payment intents covering every routing rule
 SPARK_GUIDE.md                           how to run the Spark jobs against this stack
 ```

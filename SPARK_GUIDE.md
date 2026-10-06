@@ -23,8 +23,9 @@ registry change reaches Cassandra and changes Job B's validation within seconds,
 | ----- | ----- | ----- |
 | Kafka | `localhost:9092` | |
 | Topic `institution-registry-events` | Kafka | One message per insert/update in MongoDB, value = the full document as JSON. Starts with the 5 seeded institutions. Read by Job A. |
-| Topic `payment-intent-events` | Kafka | Payment intents (format in section 5). Read by Job B. |
-| Topics `rail-routing-events`, `settlement-events`, `webhook-events` | Kafka | Created empty, reserved for Job C (settlement/SLA monitoring). |
+| Topic `payment-intent-events` | Kafka | Payment intents (format in section 5). Written by `simulator/producer.py` or `test_intents.jsonl`; read by Job B. |
+| Topic `rail-routing-events` | Kafka | One message per routed transfer (format in section 5). Written by Job B; read by `simulator/consumer.py` and Job C. |
+| Topics `settlement-events`, `webhook-events` | Kafka | Settlement results and PayMongo-style webhooks (format in section 7). Written by `simulator/consumer.py`; to be read by Job C (settlement/SLA monitoring). |
 | Cassandra | `127.0.0.1:9042` | Keyspace `payment_pipeline` with 4 tables (section 5). |
 
 A message on `institution-registry-events` looks like:
@@ -134,7 +135,7 @@ spark-submit \
 It prints one summary line per batch, e.g. `[batch 0] REJECTED/NO_ELIGIBLE_RAIL: 2, ROUTED/INSTAPAY: 2, ...`.
 
 Both jobs read `startingOffsets=earliest` on their first run and then resume from their checkpoint
-(section 7). `KAFKA_BOOTSTRAP_SERVERS`, `CASSANDRA_HOST` and `CHECKPOINT_DIR` can be overridden
+(section 8). `KAFKA_BOOTSTRAP_SERVERS`, `CASSANDRA_HOST` and `CHECKPOINT_DIR` can be overridden
 with environment variables; the defaults already match the stack.
 
 **Verify Job A:**
@@ -155,16 +156,29 @@ docker exec mongodb mongosh --quiet payment_metadata --eval "db.institution_regi
 
 ### Input: `payment-intent-events`
 
-One JSON object per message:
+One PayMongo-style Payment Intent per message:
 
 ```json
-{"reference_id": "PAY-001", "source_institution_code": "BANK_BPI",
- "destination_institution_code": "EMI_GCASH", "amount": 150000, "currency": "PHP",
- "created_at": "2026-09-25T09:30:00+08:00", "metadata": {"channel": "mobile"}}
+{"id": "PAY-001", "amount": 150000, "currency": "PHP", "status": "processing",
+ "payment_method_allowed": ["dob"], "created_at": "2026-09-25T09:30:00+08:00",
+ "metadata": {"source_institution_code": "BANK_BPI",
+              "destination_institution_code": "EMI_GCASH", "channel": "mobile"}}
 ```
 
-- `amount` is in **centavos** (PayMongo convention): `150000` = PHP 1,500.00.
-- `created_at` is ISO 8601; include the `+08:00` offset. Without one it's read as Manila time.
+| Field | Source | Used by Job B |
+| ----- | ------ | ------------- |
+| `id` | PayMongo Payment Intent `id`. Becomes `reference_id` everywhere downstream. | Key |
+| `amount` | PayMongo: **centavos** (`150000` = PHP 1,500.00) | Yes |
+| `currency` | PayMongo | Yes (must be `PHP`) |
+| `status` | PayMongo Payment Intent status; the simulator sends `processing` | No |
+| `payment_method_allowed` | PayMongo payment method types (`dob`, `brankas`, `gcash`, `paymaya`) | No |
+| `created_at` | ISO 8601 with `+08:00` (without an offset it's read as Manila time) | Yes (batch window, InstaPay due time) |
+| `metadata.source_institution_code` | **Custom**, nested in PayMongo's `metadata` extension field | Yes |
+| `metadata.destination_institution_code` | **Custom**, nested in `metadata` | Yes |
+| `metadata.*` (anything else, e.g. `channel`) | Custom, free-form | Stored in `metadata_json` |
+
+- Our custom fields go **inside `metadata`**, never at the top level (proposal v1 section 2, v2 slide 10).
+  An intent with `source_institution_code` at the top level is `REJECTED / INVALID_PAYLOAD`.
 - The producer does **not** choose the rail. Job B does.
 
 ### Rules, in the order they're checked (first match wins)
@@ -186,7 +200,7 @@ One JSON object per message:
   Job B with `ALLOW_PESONET_FALLBACK=false`.
 - The registry is **re-read from Cassandra on every micro-batch**, so a MongoDB change affects
   validation within seconds, with no restart.
-- Messages that aren't JSON or have no `reference_id` can't be keyed, so they go to
+- Messages that aren't JSON or have no `id` can't be keyed, so they go to
   `invalid_intent_events` (by Kafka offset) instead of being dropped.
 
 ### PESONet batch windows (Asia/Manila time)
@@ -214,8 +228,26 @@ One JSON object per message:
 **Timestamps display in UTC** in cqlsh (`+0000`). Add 8 hours for Manila time:
 `02:00` = 10 AM, `05:00` = 1 PM, `08:00` = 4 PM.
 
-**Known limitation:** re-sending an intent with a `reference_id` that already exists makes Job B
-decide it again and overwrite the earlier row. Always use a new `reference_id` when testing.
+### Output topic: `rail-routing-events`
+
+After the Cassandra writes, Job B publishes one message per **ROUTED** intent (rejections are
+only in Cassandra). Key = `reference_id`. Timestamps are ISO 8601 in Manila time:
+
+```json
+{"reference_id": "PAY-002", "source_institution_code": "BANK_UNIONBANK",
+ "destination_institution_code": "BANK_BPI", "amount": 7500000, "currency": "PHP",
+ "rail_selected": "PESONET", "routing_reason": "ABOVE_INSTAPAY_CAP", "threshold_applied": 5000000,
+ "created_at": "2026-09-25T09:30:00.000+08:00", "batch_window": "2026-09-25T10:00:00.000+08:00",
+ "settlement_due": "2026-09-25T10:00:00.000+08:00", "routing_timestamp": "2026-09-30T14:02:11.412+08:00"}
+```
+
+- `rail_selected`: `INSTAPAY` or `PESONET`. `threshold_applied`: the InstaPay cap in centavos.
+- `batch_window` is `null` for InstaPay (always present, never missing).
+- **At-least-once:** if a micro-batch is replayed (crash, deleted checkpoint), its routing events are
+  published again. Anything reading this topic must treat a repeated `reference_id` as a duplicate.
+
+**Known limitation:** re-sending an intent with an `id` that already exists makes Job B
+decide it again and overwrite the earlier row. Always use a new `id` when testing.
 Proper duplicate handling is planned for Job C.
 
 ## 6. Test with `test_intents.jsonl`
@@ -248,7 +280,13 @@ Expected (12 rows, plus 2 rows in `invalid_intent_events`):
 | PAY-010 | Negative amount | REJECTED INVALID_AMOUNT | — |
 | PAY-011 | USD | REJECTED UNSUPPORTED_CURRENCY | — |
 | PAY-012 | Arrives exactly at 10:00 | ROUTED PESONET | 05:00 → **13:00** |
-| (no reference_id), `this is not json` | Unkeyable messages | in `invalid_intent_events` | — |
+| (no `id`), `this is not json` | Unkeyable messages | in `invalid_intent_events` | — |
+
+The 7 ROUTED intents also appear on `rail-routing-events`:
+
+```powershell
+docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server kafka:19092 --topic rail-routing-events --from-beginning --timeout-ms 10000
+```
 
 A per-institution lookup (the single-partition query from the proposal):
 
@@ -265,14 +303,119 @@ Shows a MongoDB change altering validation with no restart:
    docker exec mongodb mongosh --quiet payment_metadata --eval "db.institution_registry.updateOne({institution_code:'EMI_GCASH'},{`$set:{active:false}})"
    ```
 2. Wait for Job A's tab to print `EMI_GCASH=inactive`.
-3. Send an intent to GCash with a **new** `reference_id`:
+3. Send an intent to GCash with a **new** `id`:
    ```powershell
-   '{"reference_id": "PAY-100", "source_institution_code": "BANK_BPI", "destination_institution_code": "EMI_GCASH", "amount": 100000, "currency": "PHP", "created_at": "2026-09-25T11:00:00+08:00", "metadata": {}}' | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 --topic payment-intent-events
+   '{"id": "PAY-100", "amount": 100000, "currency": "PHP", "status": "processing", "payment_method_allowed": ["dob"], "created_at": "2026-09-25T11:00:00+08:00", "metadata": {"source_institution_code": "BANK_BPI", "destination_institution_code": "EMI_GCASH"}}' | docker exec -i kafka /opt/kafka/bin/kafka-console-producer.sh --bootstrap-server kafka:19092 --topic payment-intent-events
    ```
 4. It comes back `REJECTED / INACTIVE_DESTINATION`; PAY-001 (decided earlier) stays ROUTED.
 5. Set GCash back to `active:true`.
 
-## 7. Checkpoints and resets
+## 7. Live traffic: `simulator/producer.py` and `simulator/consumer.py`
+
+`test_intents.jsonl` is a fixed rule check. For continuous traffic, and for anything on the
+settlement and webhook topics, use the two simulator scripts. They're plain Python (no Spark) and
+run from PowerShell or WSL, against `localhost:9092`:
+
+```bash
+pip install -r simulator/requirements.txt
+```
+
+```
+producer.py ──► payment-intent-events ──► Job B ──► rail-routing-events
+                                                          │
+consumer.py ◄─────────────────────────────────────────────┘
+   ├──► settlement-events
+   └──► webhook-events ──► (Job C, next)
+```
+
+With Job A and Job B running, open two more terminals:
+
+**Terminal 3: the settlement simulator (start it first)**
+
+```bash
+python simulator/consumer.py
+```
+
+**Terminal 4: the intent producer**
+
+```bash
+python simulator/producer.py                  # 2 intents/s until Ctrl+C
+python simulator/producer.py --rate 10 --count 200
+python simulator/producer.py --count 5 --dry-run   # just print 5 intents
+```
+
+Every run of either script takes `--seed N` for repeatable output; `--help` lists all options.
+
+### Producer
+
+Sends intents in the section 5 format with `created_at` = now, from the 5 seeded institutions.
+About 70% are InstaPay-sized, 25% above the cap, and 5% exactly PHP 50,000.00 or 50,000.01.
+`--defect-rate` (default 0.10) mixes in one of these per damaged message:
+
+| Defect | What Job B does with it |
+| ------ | ----------------------- |
+| `duplicate` (earlier intent re-sent, same `id`) | Keeps one ledger row; publishes the routing event again |
+| `late` (`created_at` 10–120 s in the past) | Routes it normally (out-of-order arrival) |
+| `unknown_destination`, `missing_source`, `negative_amount`, `wrong_currency` | `REJECTED` with the matching reason |
+| `missing_id`, `not_json` | `invalid_intent_events` |
+
+### Consumer (settlement simulator)
+
+Reads `rail-routing-events` (consumer group `settlement-simulator`) and plays the rail and
+PayMongo for every routed transfer. It never routes anything itself; it uses Job B's decision.
+
+| Rail | What it sends |
+| ---- | ------------- |
+| InstaPay | `settled` (or `failed`, 3%) 1–10 s after routing, then a `payment.paid` / `payment.failed` webhook |
+| PESONet | `pending` right away; `settled`/`failed` **30 s later** (`--pesonet-delay`), then the webhook |
+| PESONet with `--real-windows` | `pending` right away; `settled`/`failed` at the real `batch_window` (can be days away) |
+
+Real windows are hours apart, too slow for a demo, so the default is the 30 s demo delay.
+It also injects these defects (proposal v1 section 6.5); `--no-defects` turns them and failures off:
+
+| Defect | Rate flag (default) | Effect |
+| ------ | ------------------- | ------ |
+| `duplicate_webhook` | `--duplicate-webhook-rate` (0.10) | Same webhook `id` delivered 2–3 times, `delivery_attempt` 1, 2, 3 |
+| `missing_webhook` | `--missing-webhook-rate` (0.05) | Settlement arrives, webhook never does |
+| `stuck` | `--stuck-rate` (0.03) | No final settlement and no webhook (PESONet still gets `pending`) |
+| `out_of_order` | `--out-of-order-rate` (0.05) | Webhook arrives before the settlement event |
+| `late` | `--late-rate` (0.05) | InstaPay settles 5–30 s **after** `settlement_due` (SLA breach) |
+
+- It skips a `reference_id` it has already handled, since routing events are at-least-once.
+- On first start it reads `rail-routing-events` from the beginning, so it also settles anything Job B
+  routed earlier (e.g. the test intents). `--from-latest` skips those; it only applies to a group
+  with no saved position (use a new `--group` name to start over).
+- Scheduled events are **in memory**. Stop the script and anything still scheduled is never sent;
+  those transfers will look stuck. It prints how many on exit.
+
+### `settlement-events` format
+
+Key = `reference_id`. One `pending` (PESONet only) and one final event per transfer:
+
+```json
+{"id": "st_q3N0...", "reference_id": "pi_TJ7i...", "rail": "PESONET", "settlement_status": "settled",
+ "settlement_timestamp": "2026-09-30T14:02:41.118+08:00", "batch_window": "2026-09-30T16:00:00.000+08:00",
+ "source_institution_code": "BANK_BPI", "destination_institution_code": "BANK_UNIONBANK", "amount": 7500000}
+```
+
+- `settlement_status`: `pending`, `settled` or `failed` (proposal v1 section 6.3).
+- `settlement_timestamp` is when the event was sent. In demo mode a PESONet transfer settles before
+  its `batch_window`; that's the 30 s shortcut, not a bug.
+
+### `webhook-events` format
+
+Key = `reference_id`. Shaped on PayMongo's webhook event, flattened as in proposal v1 section 6.4:
+
+```json
+{"id": "evt_8KfL...", "type": "payment.paid",
+ "data": {"reference_id": "pi_TJ7i...", "amount": 289874, "currency": "PHP", "rail": "INSTAPAY"},
+ "delivery_attempt": 1, "received_timestamp": "2026-09-30T14:02:19.530+08:00"}
+```
+
+- `type`: `payment.paid` or `payment.failed`.
+- Redeliveries keep the **same `id`** with a higher `delivery_attempt`, so `id` is the de-duplication key.
+
+## 8. Checkpoints and resets
 
 Each job stores its Kafka read position in a checkpoint folder:
 `~/checkpoints/registry_sync` (Job A) and `~/checkpoints/validate_ledger` (Job B).
@@ -286,9 +429,17 @@ They're in your home folder, not `/tmp`, because WSL can clear `/tmp` on restart
   ```
 - **After pulling a changed job script**, delete that job's checkpoint too. Deleting Job A's is
   always safe (it replays the topic and keeps the latest state). Deleting Job B's makes it
-  reprocess every intent; the rows it writes are the same, since writes are upserts by key.
+  reprocess every intent: the Cassandra rows are the same (writes are upserts by key), but every
+  routed intent is published to `rail-routing-events` again, and `consumer.py` will ignore
+  the ones it has already seen only if it has been running since then.
+- **The intent format changed** (fields moved into `metadata`, `reference_id` became `id`). Old
+  flat-format messages still on `payment-intent-events` can't be keyed any more. For a clean start:
+  ```bash
+  docker compose down -v && docker compose up -d --build     # PowerShell: run the two separately
+  rm -rf ~/checkpoints/registry_sync ~/checkpoints/validate_ledger   # in WSL
+  ```
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause / fix |
 | ------- | ----------- |
@@ -299,6 +450,9 @@ They're in your home folder, not `/tmp`, because WSL can clear `/tmp` on restart
 | `Connection refused` to `localhost:9092` or `9042` | WSL is in NAT mode (section 3), or the stack isn't up (`docker compose ps -a`). |
 | `Failed to find data source: kafka` / `org.apache.spark.sql.cassandra` | Missing `--packages`, or versions don't match your Spark (section 2). |
 | `NoSuchMethodError` / `ClassNotFoundException` mentioning Cassandra | You're running Spark 4.x. Run from WSL with Spark 3.5.7. |
-| `Partition ... offset ... is out of range` / data loss error | Stack was reset with `down -v`; delete checkpoints (section 7). |
+| `Partition ... offset ... is out of range` / data loss error | Stack was reset with `down -v`; delete checkpoints (section 8). |
 | All columns `null` in Cassandra | Field names in the JSON don't match the schema; compare with the console consumer output. |
+| Every intent is `REJECTED / INVALID_PAYLOAD`, or lands in `invalid_intent_events` | Old flat format (`reference_id`, `source_institution_code` at the top level). Use `id` and put the institution codes inside `metadata` (section 5). |
+| `consumer.py` prints nothing | Job B isn't publishing: check it's running the current script and that intents are `ROUTED`. Check the topic with the console consumer (section 6). |
+| `NoBrokersAvailable` from a simulator script | The stack isn't up, or (in WSL) networking isn't mirrored (section 3). |
 | Batch windows look 8 hours off | They aren't: cqlsh shows UTC. Add 8 hours for Manila time. |
