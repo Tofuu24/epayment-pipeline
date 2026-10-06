@@ -8,7 +8,7 @@
 --   and webhook_events_by_reference.
 
 CREATE KEYSPACE IF NOT EXISTS payment_pipeline
-  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1};
+  WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 3};
 
 -- Written by Spark Job A (registry sync from Kafka)
 CREATE TABLE IF NOT EXISTS payment_pipeline.institution_registry (
@@ -130,3 +130,14 @@ ALTER TABLE payment_pipeline.settlement_alerts_by_rail ADD IF NOT EXISTS risk_fl
 -- Ledger provenance columns (Job B).
 ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXISTS schema_version int;
 ALTER TABLE payment_pipeline.transaction_lifecycle_by_reference ADD IF NOT EXISTS ingested_at timestamp;
+
+-- NEW: Append-only Event-Sourced Ledger
+-- This table records every state transition as an immutable event instead of mutating the current state.
+CREATE TABLE IF NOT EXISTS payment_pipeline.ledger_events (
+    reference_id text,
+    event_id text,
+    event_type text,
+    event_timestamp timestamp,
+    payload_json text,
+    PRIMARY KEY ((reference_id), event_id)
+);

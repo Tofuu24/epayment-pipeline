@@ -441,6 +441,16 @@ def process_batch(batch_df, batch_id):
             now.alias("ingested_at")),
             "transaction_lifecycle_by_reference")
 
+        # Step 9: Write exactly-once append-only event sourced ledger
+        ledger_events = decided.select(
+            "reference_id",
+            F.concat_ws("-", F.lit(INTENT_TOPIC), F.col("kafka_partition").cast("string"), F.col("kafka_offset").cast("string")).alias("event_id"),
+            F.lit("PAYMENT_ROUTED").alias("event_type"),
+            now.alias("event_timestamp"),
+            F.to_json(F.struct("status", "rail", "routing_reason", "risk_flags", "amount", "currency")).alias("payload_json")
+        )
+        write_cassandra(ledger_events, "ledger_events")
+
         # Summary log line
         summary = decided.groupBy("status", F.coalesce("rail", "rejection_reason").alias("detail")) \
                          .count().orderBy("status", "detail").collect()
